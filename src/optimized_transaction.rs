@@ -5,6 +5,7 @@ use crate::types::{
 };
 use crate::Helius;
 
+use borsh::de::BorshDeserialize;
 use bincode::{serialize, ErrorKind};
 use reqwest::StatusCode;
 use solana_client::rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig};
@@ -136,15 +137,25 @@ impl Helius {
             .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())?;
         let mut final_instructions: Vec<Instruction> = vec![];
 
-        // Check if any of the instructions provided set the compute unit price and/or limit, and throw an error if `true`
-        let existing_compute_budget_instructions: bool = config.instructions.iter().any(|instruction| {
-            instruction.program_id == ComputeBudgetInstruction::set_compute_unit_limit(0).program_id
-                || instruction.program_id == ComputeBudgetInstruction::set_compute_unit_price(0).program_id
-        });
-
-        if existing_compute_budget_instructions {
+        let parse_compute_budget = |ix: &Instruction| -> Option<ComputeBudgetInstruction> {
+            // All instructions use the same program, so check against an arbitrary one.
+            if ix.program_id != ComputeBudgetInstruction::set_compute_unit_limit(0).program_id {
+                return None;
+            }
+            ComputeBudgetInstruction::try_from_slice(&ix.data[..]).ok()
+        };
+        let parsed_compute_budget_instructions: Vec<ComputeBudgetInstruction> =
+            config.instructions.iter().flat_map(parse_compute_budget).collect();
+        // Check if any of the instructions provided set the compute unit price and/or limit, and throw an error if price was set.
+        // If limit is set, skip estimating it later.
+        let existing_compute_unit_limit: Option<u32> = parsed_compute_budget_instructions.iter().flat_map(
+            |cbi| if let ComputeBudgetInstruction::SetComputeUnitLimit(lim) = cbi { Some(lim) } else { None })
+            .next().copied();
+        let existing_compute_unit_price_ix: bool = parsed_compute_budget_instructions.iter().any(
+            |cbi| matches!(cbi, ComputeBudgetInstruction::SetComputeUnitPrice(_)));
+        if existing_compute_unit_price_ix {
             return Err(HeliusError::InvalidInput(
-                "Cannot provide instructions that set the compute unit price and/or limit".to_string(),
+                "Cannot provide instructions that set the compute unit price".to_string(),
             ));
         }
 
@@ -232,33 +243,24 @@ impl Helius {
         updated_instructions.push(compute_budget_ix.clone());
         final_instructions.push(compute_budget_ix);
 
-        // Get the optimal compute units
-        let units: Option<u64> = self
-            .get_compute_units(
+        // Add the estimated compute units if necessary.
+        if existing_compute_unit_limit.is_none() {
+            let estimated_compute_units = self.get_compute_units(
                 updated_instructions,
                 payer_pubkey,
                 config.lookup_tables.clone().unwrap_or_default(),
                 &config.signers,
-            )
-            .await?;
-
-        if units.is_none() {
-            return Err(HeliusError::InvalidInput(
+            ).await?.ok_or(HeliusError::InvalidInput(
                 "Error fetching compute units for the instructions provided".to_string(),
-            ));
-        }
-
-        let compute_units: u64 = units.unwrap();
-        println!("{}", compute_units);
-        let customers_cu: u32 = if compute_units < 1000 {
-            1000
-        } else {
-            (compute_units as f64 * 1.1).ceil() as u32
+            ))?;
+            let customers_cu: u32 = if estimated_compute_units < 1000 {
+                1000
+            } else {
+                (estimated_compute_units as f64 * 1.1).ceil() as u32
+            };
+            let compute_units_ix: Instruction = ComputeBudgetInstruction::set_compute_unit_limit(customers_cu);
+            final_instructions.push(compute_units_ix);
         };
-
-        // Add the compute unit limit instruction with a margin
-        let compute_units_ix: Instruction = ComputeBudgetInstruction::set_compute_unit_limit(customers_cu);
-        final_instructions.push(compute_units_ix);
 
         // Add the original instructions back
         final_instructions.extend(config.instructions.clone());
